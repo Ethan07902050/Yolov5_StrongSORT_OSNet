@@ -35,6 +35,9 @@ from yolov5.utils.torch_utils import select_device, time_sync
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from strong_sort.utils.parser import get_config
 from strong_sort.strong_sort import StrongSORT
+from reid import REID
+from tqdm import tqdm
+import cv2
 
 # remove duplicated stream handler to avoid duplicated logging
 logging.getLogger().removeHandler(logging.getLogger().handlers[0])
@@ -70,6 +73,9 @@ def run(
         hide_class=False,  # hide IDs
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
+        base_id=0, # avoid repetitive ids in two videos
+        torchreid_weights='', # dummy param
+        save_dir='runs/track/exp',
 ):
 
     source = str(source)
@@ -81,15 +87,15 @@ def run(
         source = check_file(source)  # download
 
     # Directories
-    if not isinstance(yolo_weights, list):  # single yolo model
-        exp_name = yolo_weights.stem
-    elif type(yolo_weights) is list and len(yolo_weights) == 1:  # single models after --yolo_weights
-        exp_name = Path(yolo_weights[0]).stem
-    else:  # multiple models after --yolo_weights
-        exp_name = 'ensemble'
-    exp_name = name if name else exp_name + "_" + strong_sort_weights.stem
-    save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
-    (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+    # if not isinstance(yolo_weights, list):  # single yolo model
+    #     exp_name = yolo_weights.stem
+    # elif type(yolo_weights) is list and len(yolo_weights) == 1:  # single models after --yolo_weights
+    #     exp_name = Path(yolo_weights[0]).stem
+    # else:  # multiple models after --yolo_weights
+    #     exp_name = 'ensemble'
+    # exp_name = name if name else exp_name + "_" + strong_sort_weights.stem
+    # save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
+    # (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
     # Load model
     device = select_device(device)
@@ -137,6 +143,8 @@ def run(
     model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0, 0.0], 0
     curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources
+    image_by_ids = {}
+    ids_per_frame, annotations = [], []
     for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
@@ -158,6 +166,8 @@ def run(
         dt[2] += time_sync() - t3
 
         # Process detections
+        current_frame_ids = set()
+        current_frame_annotations = []
         for i, det in enumerate(pred):  # detections per image
             seen += 1
             if webcam:  # nr_sources >= 1
@@ -211,8 +221,25 @@ def run(
                     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
     
                         bboxes = output[0:4]
-                        id = output[4]
+                        id = int(output[4]) + base_id
                         cls = output[5]
+                        crop = save_one_box(bboxes, imc, save=False, BGR=True)
+                        
+                        # Discard the image if width or height equals 0
+                        if crop.shape[0] == 0 or crop.shape[1] == 0:
+                            continue
+                        if id in current_frame_ids:
+                            LOGGER.info("sameid!!!")
+                        current_frame_ids.add(id)
+                        if id not in image_by_ids:
+                            image_by_ids[id] = [crop]
+                        else:
+                            image_by_ids[id].append(crop)
+                        current_frame_annotations.append({
+                            'bboxes': bboxes,
+                            'id': id,
+                            'cls': output[5],
+                        })
 
                         if save_txt:
                             # to MOT format
@@ -264,6 +291,8 @@ def run(
                 vid_writer[i].write(im0)
 
             prev_frames[i] = curr_frames[i]
+        ids_per_frame.append(current_frame_ids)
+        annotations.append(current_frame_annotations)
 
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
@@ -273,14 +302,103 @@ def run(
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
         strip_optimizer(yolo_weights)  # update model (to fix SourceChangeWarning)
+    
+    return image_by_ids, ids_per_frame, annotations
+
+
+def collect_candidate_ids(_id, final_fuse_id, ids_per_frame):
+    candidate_ids = set()
+    for fid in final_fuse_id:
+        same_frame = 0
+        for ids in ids_per_frame:
+            if fid in ids and _id in ids:
+                if final_fuse_id[fid] in candidate_ids:
+                    candidate_ids.remove(final_fuse_id[fid])
+                same_frame = 1
+                break
+
+        if not same_frame:
+            candidate_ids.add(final_fuse_id[fid])
+
+    return candidate_ids 
+
+
+def find_closest_person(_id, candidate_ids, image_by_ids, reid, feats):
+    threshold = 320
+    dis = [{
+        'id': cid,
+        'distance': np.mean(reid.compute_distance(feats[_id],feats[cid]))
+    } for cid in candidate_ids]
+    dis.sort(key=lambda item: item['distance'])
+
+    if len(dis) != 0 and dis[0]['distance'] < threshold:
+        return dis[0]['id']
+    return _id
+
+
+def person_reid(image_by_ids, ids_per_frame, weights):
+    reid = REID(weights)
+
+    LOGGER.info(f'Total IDs = {len(image_by_ids)}')
+    feats = dict()
+    for _id in image_by_ids:
+        LOGGER.info(f'ID number {_id} -> Number of frames {len(image_by_ids[_id])}')
+        feats[_id] = reid._features(image_by_ids[_id])
+
+    final_fuse_id = dict()
+    for _id in image_by_ids.keys():
+        if len(image_by_ids[_id]) < 10:
+            continue
+
+        candidate_ids = collect_candidate_ids(_id, final_fuse_id, ids_per_frame)
+        final_fuse_id[_id] = find_closest_person(_id, candidate_ids, image_by_ids, reid, feats)
+    
+    return final_fuse_id
+
+
+def save_videos(source, save_dir, annotations, final_fuse_id):
+    cap = cv2.VideoCapture(source)
+    frame_rate = int(round(cap.get(cv2.CAP_PROP_FPS)))
+    vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    vn = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    assert vn == len(annotations)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    filename = source.split('/')[-1]
+    savepath = save_dir / filename
+    out = cv2.VideoWriter(str(savepath), fourcc, frame_rate, (vw, vh))
+    frame_idx = 0
+    with tqdm(total=vn) as pbar:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            annotator = Annotator(frame, line_width=2, pil=not ascii)
+            for det in annotations[frame_idx]:
+                if det['id'] in final_fuse_id:
+                    bboxes = det['bboxes']
+                    label = str(final_fuse_id[det['id']])
+                    c = int(det['cls'])
+                    annotator.box_label(bboxes, label, color=colors(c, True))
+            
+            im = annotator.result()
+            out.write(im)
+            frame_idx += 1
+            pbar.update(1)
+
+    cap.release()
+    out.release()
 
 
 def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--yolo-weights', nargs='+', type=str, default=WEIGHTS / 'yolov5m.pt', help='model.pt path(s)')
     parser.add_argument('--strong-sort-weights', type=str, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
+    parser.add_argument('--torchreid-weights', type=str, default=WEIGHTS / 'model.pth.tar-60')
     parser.add_argument('--config-strongsort', type=str, default='strong_sort/configs/strong_sort.yaml')
-    parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')  
+    parser.add_argument('--source', nargs='+', default=[], help='file/dir/URL/glob, 0 for webcam')  
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
@@ -315,8 +433,31 @@ def parse_opt():
 
 def main(opt):
     check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
-    run(**vars(opt))
+    
+    # Person id -> cropped person images
+    image_by_ids = {}
+    base_id = 0
 
+    # People that appear in each frame
+    ids_per_frame = []
+    annotations = []
+
+    save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)  # increment run
+    save_dir.mkdir(parents=True, exist_ok=True)  # make dir
+
+    sources = opt.source
+    for src in sources:
+        opt.source = src
+        images, ids, ann = run(**vars(opt), base_id=base_id, save_dir=save_dir)
+        base_id = max(list(images.keys()))    
+        image_by_ids.update(images)
+        ids_per_frame += ids
+        annotations.append(ann)
+
+    final_fuse_id = person_reid(image_by_ids, ids_per_frame, opt.torchreid_weights)
+    for i, src in enumerate(sources):
+        LOGGER.info(f'Saving video #{i}')
+        save_videos(src, save_dir, annotations[i], final_fuse_id)
 
 if __name__ == "__main__":
     opt = parse_opt()
